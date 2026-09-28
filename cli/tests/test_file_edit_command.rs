@@ -193,6 +193,55 @@ fn test_file_edit() -> TestResult {
 }
 
 #[test]
+fn test_file_edit_gitattributes_filter_in_temp_snapshot() -> TestResult {
+    let mut test_env = TestEnvironment::default();
+    let edit_script = test_env.set_up_fake_editor();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    work_dir.write_file(".gitattributes", "*.bin filter=lfs\n");
+    work_dir.write_file("file.bin", "original\n");
+    work_dir
+        .run_jj(["--config=git.ignore-filters=[]", "commit", "-m", "base"])
+        .success();
+
+    std::fs::write(&edit_script, "expect\noriginal\n\0write\nmodified\n")?;
+    work_dir
+        .run_jj(["file", "edit", "-r", "@-", "file.bin"])
+        .success();
+    // Only file.bin is materialized. Attributes must be read from the tree,
+    // preserving the tracked contents instead of snapshotting the editor's edit.
+    assert_eq!(
+        work_dir
+            .run_jj(["file", "show", "-r", "@-", "file.bin"])
+            .success()
+            .stdout
+            .raw(),
+        "original\n"
+    );
+
+    // Disabling filter ignores must still allow the explicit edit.
+    work_dir
+        .run_jj([
+            "--config=git.ignore-filters=[]",
+            "file",
+            "edit",
+            "-r",
+            "@-",
+            "file.bin",
+        ])
+        .success();
+    assert_eq!(
+        work_dir
+            .run_jj(["file", "show", "-r", "@-", "file.bin"])
+            .success()
+            .stdout
+            .raw(),
+        "modified\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_file_edit_conflict() -> TestResult {
     let mut test_env = TestEnvironment::default();
     let edit_script = test_env.set_up_fake_editor();

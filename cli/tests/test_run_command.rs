@@ -68,6 +68,125 @@ fn test_run_simple() {
 }
 
 #[test]
+fn test_run_gitattributes_filter_in_temp_snapshot() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let fake_formatter = assert_cmd::cargo::cargo_bin("fake-formatter");
+    assert!(fake_formatter.is_file());
+    let fake_formatter_path = fake_formatter.to_string_lossy().into_owned();
+    let work_dir = test_env.work_dir("repo");
+
+    work_dir.write_file(".gitattributes", "*.bin filter=lfs\n");
+    work_dir.write_file("file.bin", "original");
+    work_dir
+        .run_jj(["--config=git.ignore-filters=[]", "commit", "-m", "base"])
+        .success();
+
+    work_dir
+        .run_jj([
+            "run",
+            "-r",
+            "@-",
+            "--",
+            &fake_formatter_path,
+            "--stdout",
+            "modified",
+            "--tee",
+            "file.bin",
+        ])
+        .success();
+
+    // Regression test for a bug found during development.
+    //
+    // This creates a legitimately tracked file by disabling filter ignores only
+    // for setup. `jj run` then operates with normal settings. Its temporary
+    // working copy is snapshotted after the command runs, and that snapshot must
+    // use the configured .gitattributes filters. Otherwise a command can rewrite
+    // a tracked LFS-filtered file even though normal snapshots would ignore it.
+    insta::assert_snapshot!(
+        work_dir.run_jj(["file", "show", "-r", "@-", "file.bin"]).success().stdout,
+        @"original[EOF]"
+    );
+}
+
+#[test]
+fn test_run_gitattributes_filter_with_sparse_reused_workspace() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let fake_formatter = assert_cmd::cargo::cargo_bin("fake-formatter");
+    let fake_formatter_path = fake_formatter.to_string_lossy().into_owned();
+    let work_dir = test_env.work_dir("repo");
+    work_dir.write_file(".gitattributes", "*.bin filter=lfs\n");
+    work_dir.write_file("file.bin", "original");
+    work_dir.write_file("regular", "original");
+    work_dir
+        .run_jj(["--config=git.ignore-filters=[]", "commit", "-m", "base"])
+        .success();
+    work_dir
+        .run_jj([
+            "sparse", "set", "--clear", "--add", "file.bin", "--add", "regular",
+        ])
+        .success();
+
+    // Seed the reused slot with an empty checkout before changing its patterns.
+    work_dir
+        .run_jj([
+            "run",
+            "-r",
+            "@-",
+            "--sparse-patterns",
+            "empty",
+            "--",
+            &fake_formatter_path,
+            "--stdout",
+            "",
+        ])
+        .success();
+    let mut expected_contents = "original".to_owned();
+    for (patterns, clean, contents) in [
+        ("copy", false, "sparse"),
+        ("full", false, "full"),
+        ("copy", true, "clean"),
+    ] {
+        let mut args = vec!["run", "-r", "@-", "--sparse-patterns", patterns];
+        if clean {
+            args.push("--clean");
+        }
+        args.extend([
+            "--",
+            &fake_formatter_path,
+            "--stdout",
+            contents,
+            "--tee",
+            "file.bin",
+            "--tee",
+            "regular",
+        ]);
+        work_dir.run_jj(args).success();
+        // fake-formatter --tee appends to each existing file.
+        expected_contents.push_str(contents);
+        // In copy mode .gitattributes is absent from disk, so filtering must
+        // fall back to the commit tree even after reusing or cleaning a slot.
+        assert_eq!(
+            work_dir
+                .run_jj(["file", "show", "-r", "@-", "file.bin"])
+                .success()
+                .stdout
+                .raw(),
+            "original"
+        );
+        assert_eq!(
+            work_dir
+                .run_jj(["file", "show", "-r", "@-", "regular"])
+                .success()
+                .stdout
+                .raw(),
+            expected_contents
+        );
+    }
+}
+
+#[test]
 fn test_run_on_immutable() {
     let test_env = TestEnvironment::default();
     test_env.run_jj_in(".", ["git", "init", "repo"]).success();

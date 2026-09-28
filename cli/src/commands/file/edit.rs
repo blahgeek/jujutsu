@@ -121,6 +121,9 @@ pub(crate) async fn cmd_file_edit(
         eol_conversion_mode: EolConversionMode::None,
         exec_change_setting: ExecChangeSetting::Auto,
         fsmonitor_settings: FsmonitorSettings::None,
+        // A sparse checkout may omit .gitattributes. Snapshot still needs the
+        // configured filters and the attributes fallback from the commit tree.
+        ..TreeStateSettings::try_from_user_settings(workspace_command.settings())?
     };
     let mut tree_state = TreeState::init(
         repo.store().clone(),

@@ -16,6 +16,10 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New features
 
+* In Git-backed repositories, snapshotting ignores files with `filter=lfs` in
+  `.gitattributes` by default. Configure `git.ignore-filters` to change the list.
+  Checkout and Git LFS downloads still require Git LFS commands.
+
 ### Fixed bugs
 
 ## [0.46.0] - 2026-10-07

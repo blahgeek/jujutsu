@@ -93,6 +93,16 @@ use crate::fsmonitor::FsmonitorSettings;
 use crate::fsmonitor::WatchmanConfig;
 #[cfg(feature = "watchman")]
 use crate::fsmonitor::watchman;
+#[cfg(feature = "git")]
+use crate::git::GitSettings;
+#[cfg(feature = "git")]
+use crate::gitattributes::DiskFileLoader;
+#[cfg(feature = "git")]
+use crate::gitattributes::GitAttributes;
+#[cfg(feature = "git")]
+use crate::gitattributes::SearchPriority;
+#[cfg(feature = "git")]
+use crate::gitattributes::TreeFileLoader;
 use crate::gitignore::GitIgnoreFile;
 use crate::lock::FileLock;
 use crate::matchers::DifferenceMatcher;
@@ -977,6 +987,10 @@ pub struct TreeStateSettings {
     pub exec_change_setting: ExecChangeSetting,
     /// The fsmonitor (e.g. Watchman) to use, if any.
     pub fsmonitor_settings: FsmonitorSettings,
+
+    /// Names of .gitattributes filters whose matching files should be ignored
+    /// in the working copy.
+    pub ignore_filters: HashSet<String>,
 }
 
 impl TreeStateSettings {
@@ -987,6 +1001,19 @@ impl TreeStateSettings {
             eol_conversion_mode: EolConversionMode::try_from_settings(user_settings)?,
             exec_change_setting: user_settings.get("working-copy.exec-bit-change")?,
             fsmonitor_settings: FsmonitorSettings::from_settings(user_settings)?,
+            ignore_filters: {
+                #[cfg(feature = "git")]
+                {
+                    GitSettings::from_settings(user_settings)?
+                        .ignore_filters
+                        .into_iter()
+                        .collect()
+                }
+                #[cfg(not(feature = "git"))]
+                {
+                    HashSet::new()
+                }
+            },
         })
     }
 }
@@ -1011,6 +1038,9 @@ pub struct TreeState {
     exec_policy: ExecChangePolicy,
     fsmonitor_settings: FsmonitorSettings,
     target_eol_strategy: TargetEolStrategy,
+
+    #[cfg_attr(not(feature = "git"), allow(dead_code))]
+    ignore_filters: HashSet<String>,
 }
 
 #[derive(Debug, Error)]
@@ -1084,9 +1114,18 @@ impl TreeState {
             eol_conversion_mode,
             exec_change_setting,
             fsmonitor_settings,
+            ignore_filters: settings_ignore_filters,
         }: &TreeStateSettings,
     ) -> Self {
         let exec_policy = ExecChangePolicy::new(*exec_change_setting, &state_path);
+
+        // Only enable ignore filters when using Git.
+        let ignore_filters = if store.backend().name() == "git" {
+            settings_ignore_filters.clone()
+        } else {
+            HashSet::new()
+        };
+
         Self {
             store: store.clone(),
             working_copy_path,
@@ -1101,6 +1140,7 @@ impl TreeState {
             exec_policy,
             fsmonitor_settings: fsmonitor_settings.clone(),
             target_eol_strategy: TargetEolStrategy::new(*eol_conversion_mode),
+            ignore_filters,
         }
     }
 
@@ -1337,6 +1377,11 @@ impl TreeState {
         let (untracked_paths_tx, untracked_paths_rx) = channel();
         let (invalid_utf8_paths_tx, invalid_utf8_paths_rx) = channel();
         let (deleted_files_tx, deleted_files_rx) = channel();
+        #[cfg(feature = "git")]
+        let git_attributes = Arc::new(GitAttributes::new(
+            TreeFileLoader::new(self.tree.clone()),
+            DiskFileLoader::new(self.working_copy_path.clone()),
+        ));
 
         trace_span!("traverse filesystem").in_scope(|| -> Result<(), SnapshotError> {
             let snapshotter = FileSnapshotter {
@@ -1355,6 +1400,10 @@ impl TreeState {
                 error: OnceLock::new(),
                 progress: *progress,
                 max_new_file_size: *max_new_file_size,
+                #[cfg(feature = "git")]
+                git_attributes,
+                #[cfg(feature = "git")]
+                ignore_filters: self.ignore_filters.clone(),
             };
             let directory_to_visit = DirectoryToVisit {
                 dir: RepoPathBuf::root(),
@@ -1470,31 +1519,36 @@ impl TreeState {
         let matcher: Option<Box<dyn Matcher>> = match changed_files {
             None => None,
             Some(changed_files) => {
-                let (repo_paths, gitignore_prefixes) = trace_span!("processing fsmonitor paths")
+                let (repo_paths, subtree_prefixes) = trace_span!("processing fsmonitor paths")
                     .in_scope(|| {
                         let repo_paths = changed_files
                             .iter()
                             .filter_map(|path| RepoPathBuf::from_relative_path(path).ok())
                             .collect_vec();
-                        // .gitignore changes require rescanning parent directories to pick up newly
-                        // unignored files.
-                        let gitignore_prefixes = repo_paths
+                        // Ignore rule changes require rescanning parent subtrees to pick up
+                        // newly unignored files. Attribute filters are only enabled for Git
+                        // backends with nonempty ignore_filters.
+                        let subtree_prefixes = repo_paths
                             .iter()
                             .filter_map(|repo_path| {
                                 let (parent, basename) = repo_path.split()?;
-                                (basename.as_internal_str() == ".gitignore")
-                                    .then(|| parent.to_owned())
+                                let needs_rescan = match basename.as_internal_str() {
+                                    ".gitignore" => true,
+                                    ".gitattributes" => !self.ignore_filters.is_empty(),
+                                    _ => false,
+                                };
+                                needs_rescan.then(|| parent.to_owned())
                             })
                             .collect_vec();
-                        (repo_paths, gitignore_prefixes)
+                        (repo_paths, subtree_prefixes)
                     });
 
-                let matcher: Box<dyn Matcher> = if gitignore_prefixes.is_empty() {
+                let matcher: Box<dyn Matcher> = if subtree_prefixes.is_empty() {
                     Box::new(FilesMatcher::new(repo_paths))
                 } else {
                     Box::new(UnionMatcher::new(
                         FilesMatcher::new(repo_paths),
-                        PrefixMatcher::new(gitignore_prefixes),
+                        PrefixMatcher::new(subtree_prefixes),
                     ))
                 };
 
@@ -1544,6 +1598,11 @@ struct FileSnapshotter<'a> {
     error: OnceLock<SnapshotError>,
     progress: Option<&'a SnapshotProgress<'a>>,
     max_new_file_size: u64,
+
+    #[cfg(feature = "git")]
+    git_attributes: Arc<GitAttributes>,
+    #[cfg(feature = "git")]
+    ignore_filters: HashSet<String>,
 }
 
 impl FileSnapshotter<'_> {
@@ -1616,7 +1675,7 @@ impl FileSnapshotter<'_> {
             })
             .collect::<Result<_, _>>()?;
         let present_entries = PresentDirEntries { dirs, files };
-        self.emit_deleted_files(&dir, file_states, &present_entries);
+        self.emit_deleted_files(&dir, file_states, &present_entries)?;
         Ok(())
     }
 
@@ -1785,8 +1844,20 @@ impl FileSnapshotter<'_> {
             if let Some(progress) = self.progress {
                 progress(&path);
             }
+            #[cfg(feature = "git")]
+            if self
+                .git_attributes
+                .filter_matches(&path, &self.ignore_filters, SearchPriority::Disk)
+                .block_on()?
+            {
+                // Skip gitattributes files that we want to ignore - this
+                // would result in them showing up as deleted, but we also
+                // omit them in `emit_deleted_files` to avoid that.
+                return Ok(None);
+            }
             if maybe_current_file_state.is_none()
-                && (git_ignore.matches_file(&path) && !self.force_tracking_matcher.matches(&path))
+                && (git_ignore.matches_file(path.as_ref())
+                    && !self.force_tracking_matcher.matches(&path))
             {
                 // If it wasn't already tracked and it matches
                 // the ignored paths, then ignore it.
@@ -1843,6 +1914,14 @@ impl FileSnapshotter<'_> {
                 continue;
             }
             if !self.matcher.matches(tracked_path) {
+                continue;
+            }
+            #[cfg(feature = "git")]
+            if self
+                .git_attributes
+                .filter_matches(tracked_path, &self.ignore_filters, SearchPriority::Disk)
+                .await?
+            {
                 continue;
             }
             let disk_path = tracked_path.to_fs_path(&self.tree_state.working_copy_path)?;
@@ -1906,7 +1985,7 @@ impl FileSnapshotter<'_> {
         dir: &RepoPath,
         file_states: FileStates<'_>,
         present_entries: &PresentDirEntries,
-    ) {
+    ) -> Result<(), SnapshotError> {
         let file_state_chunks = file_states.iter().chunk_by(|(path, _state)| {
             // Extract <name> from <dir>, <dir>/<name>, or <dir>/<name>/**.
             // (file_states may contain <dir> file on file->dir transition.)
@@ -1919,18 +1998,34 @@ impl FileSnapshotter<'_> {
                 None => (PresentDirEntryKind::File, tail),
             }
         });
-        file_state_chunks
+        for (_, chunk) in file_state_chunks
             .into_iter()
             .filter(|&((kind, name), _)| match kind {
                 PresentDirEntryKind::Dir => !present_entries.dirs.contains(name),
                 PresentDirEntryKind::File => !present_entries.files.contains(name),
             })
-            .flat_map(|(_, chunk)| chunk)
-            // Whether or not the entry exists, submodule should be ignored
-            .filter(|(_, state)| state.file_type != FileType::GitSubmodule)
-            .filter(|(path, _)| self.matcher.matches(path))
-            .try_for_each(|(path, _)| self.deleted_files_tx.send(path.to_owned()))
-            .ok();
+        {
+            for (path, state) in chunk {
+                // Whether or not the entry exists, submodule should be ignored.
+                if state.file_type == FileType::GitSubmodule {
+                    continue;
+                }
+                #[cfg(feature = "git")]
+                if self
+                    .git_attributes
+                    .filter_matches(path, &self.ignore_filters, SearchPriority::Disk)
+                    .block_on()?
+                {
+                    // Whether or not the entry exists, ignored gitattributes
+                    // files should be omitted.
+                    continue;
+                }
+                if self.matcher.matches(path) {
+                    self.deleted_files_tx.send(path.to_owned()).ok();
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn get_updated_tree_value(
